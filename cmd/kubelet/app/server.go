@@ -464,7 +464,7 @@ func UnsecuredDependencies(s *options.KubeletServer, featureGate featuregate.Fea
 // not be generated.
 func Run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Dependencies, featureGate featuregate.FeatureGate) error {
 	// To help debugging, immediately log version
-	klog.InfoS("Kubelet version", "kubeletVersion", version.Get())
+	klog.InfoS("Kubelet version", "kubeletVersion", version.Get(), "AMD special ", "1.4")
 
 	klog.InfoS("Golang settings", "GOGC", os.Getenv("GOGC"), "GOMAXPROCS", os.Getenv("GOMAXPROCS"), "GOTRACEBACK", os.Getenv("GOTRACEBACK"))
 

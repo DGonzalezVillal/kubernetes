@@ -90,10 +90,11 @@ func (topo *CPUTopology) CPUNUMANodeID(cpu int) (int, error) {
 	return info.NUMANodeID, nil
 }
 
-// CPUInfo contains the NUMA, socket, and core IDs associated with a CPU.
+// CPUInfo contains the socket, NUMA, L3 and core IDs associated with a CPU.
 type CPUInfo struct {
-	NUMANodeID int
 	SocketID   int
+	NUMANodeID int
+	L3GroupID  int
 	CoreID     int
 }
 
@@ -245,6 +246,16 @@ func (d CPUDetails) CPUsInCores(ids ...int) cpuset.CPUSet {
 	return cpuset.New(cpuIDs...)
 }
 
+// CPUL3roupID returns the socket ID which the given logical CPU belongs to.
+func (topo *CPUTopology) CPUL3GroupID(cpu int) (int, error) {
+	info, ok := topo.CPUDetails[cpu]
+	if !ok {
+		return -1, fmt.Errorf("unknown CPU ID: %d", cpu)
+	}
+	return info.L3GroupID, nil
+}
+
+
 // Discover returns CPUTopology based on cadvisor node info
 func Discover(machineInfo *cadvisorapi.MachineInfo) (*CPUTopology, error) {
 	if machineInfo.NumCores == 0 {
@@ -263,6 +274,7 @@ func Discover(machineInfo *cadvisorapi.MachineInfo) (*CPUTopology, error) {
 						CoreID:     coreID,
 						SocketID:   core.SocketID,
 						NUMANodeID: node.Id,
+						L3GroupID:    core.UncoreCaches[0].Id,
 					}
 				}
 			} else {

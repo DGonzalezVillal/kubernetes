@@ -145,7 +145,7 @@ cluster's shared state through which all other components interact.`,
 // Run runs the specified APIServer.  This should never exit.
 func Run(opts options.CompletedOptions, stopCh <-chan struct{}) error {
 	// To help debugging, immediately log version
-	klog.Infof("Version: %+v", version.Get())
+	klog.Infof("Version: %+v AMD special 1.4\n", version.Get())
 
 	klog.InfoS("Golang settings", "GOGC", os.Getenv("GOGC"), "GOMAXPROCS", os.Getenv("GOMAXPROCS"), "GOTRACEBACK", os.Getenv("GOTRACEBACK"))
 

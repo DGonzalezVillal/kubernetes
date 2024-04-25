@@ -447,8 +447,424 @@ func (a *cpuAccumulator) iterateCombinations(n []int, k int, f func([]int) LoopC
 	helper(n, k, 0, []int{}, f)
 }
 
+type CoreTopology struct {
+	available int
+	coreID    int //Cpu[0]
+	cpuOneID  int //SMT on OS Cpu[1]
+}
+
+type L3Topology struct {
+	coresPerL3 int
+	available  int
+	cores      []CoreTopology
+}
+
+type NodeTopology struct {
+	available int
+	l3Groups  []L3Topology
+}
+
+type SocketTopology struct {
+	available int //total Cores available on socket
+	nodes     []NodeTopology
+}
+
+type ServerTopology struct {
+	smtOn     int
+	available int //total Cores available on server
+	sockets   []SocketTopology
+}
+
+type matchSet struct {
+	cpusets map[int]cpuset.CPUSet
+}
+
+func ServerTopologyNew(topo *topology.CPUTopology) *ServerTopology {
+	sTopo := ServerTopology{}
+	numL3GroupsPerNode := 0
+	numCoresPerL3Group := 0
+	numNodesPerSocket := 0
+	smtOn := topo.CPUsPerCore()
+	sTopo.smtOn = smtOn
+
+	klog.InfoS("serverTopologyNew")
+	//determine topology element sizes
+	for osId, cpuInfo := range topo.CPUDetails {
+		if cpuInfo.SocketID == 0 {
+			if cpuInfo.L3GroupID == 0 {
+				if osId == cpuInfo.CoreID {
+					numCoresPerL3Group++
+				}
+			}
+			if cpuInfo.L3GroupID > numL3GroupsPerNode {
+				numL3GroupsPerNode = cpuInfo.L3GroupID
+			}
+			if cpuInfo.NUMANodeID > numNodesPerSocket {
+				numNodesPerSocket = cpuInfo.NUMANodeID
+			}
+		}
+	}
+	numL3GroupsPerNode++
+	numNodesPerSocket++
+
+	//klog.InfoS("ServerTopologNew", "numLLCGroupsPerNode", numLLCGroupsPerNode, "numCoresPerLLCGroup", numCoresPerLLCGroup, "smtOn", smtOn)
+	//build topology arrays
+	for s := 0; s < topo.NumSockets; s++ {
+		newSocket := []SocketTopology{SocketTopology{}}
+		sTopo.sockets = append(sTopo.sockets, newSocket...)
+		//numNodesPerSocket := topo.NumNUMANodes / topo.NumSockets
+		for n := 0; n < numNodesPerSocket; n++ {
+			newNode := []NodeTopology{NodeTopology{}}
+			sTopo.sockets[s].nodes = append(sTopo.sockets[s].nodes, newNode...)
+			for l := 0; l < numL3GroupsPerNode; l++ {
+				newL3Group := []L3Topology{L3Topology{}}
+				newL3Group[0].coresPerL3 = numCoresPerL3Group
+				sTopo.sockets[s].nodes[n].l3Groups = append(sTopo.sockets[s].nodes[n].l3Groups, newL3Group...)
+				for c := 0; c < numCoresPerL3Group; c++ {
+					newCore := []CoreTopology{CoreTopology{}}
+					sTopo.sockets[s].nodes[n].l3Groups[l].cores = append(sTopo.sockets[s].nodes[n].l3Groups[l].cores, newCore...)
+				}
+			}
+		}
+	}
+	//populate topology instance
+	//CPUDetails entries are per CPU (SMT on)
+	//only need to parse for Cores
+	for osId, cpuInfo := range topo.CPUDetails {
+		if osId != cpuInfo.CoreID {
+			continue
+		}
+		coreIndex := 0
+		l3Index := 0 //hw supplied ID may not track OS cpuID's
+		nodeIndex := 0
+
+		if topo.NumSockets > 1 {
+			if cpuInfo.SocketID > 0 {
+				nodeIndex = cpuInfo.NUMANodeID - (numNodesPerSocket * cpuInfo.SocketID)
+			}
+		}
+		//HW L3Index's may not be in socket or node order, they may be per socket or per system
+		//build logical sub node index
+		coreIndex = cpuInfo.CoreID
+		if topo.NumSockets > 1 {
+			if cpuInfo.SocketID > 0 {
+				coreIndex = coreIndex - (numCoresPerL3Group * numL3GroupsPerNode * numNodesPerSocket * cpuInfo.SocketID)
+			}
+		}
+
+		for ; coreIndex >= (numCoresPerL3Group); coreIndex = coreIndex - numCoresPerL3Group {
+			l3Index++
+		}
+
+		sTopo.sockets[cpuInfo.SocketID].nodes[nodeIndex].l3Groups[l3Index].cores[coreIndex].coreID = osId
+		if smtOn > 0 {
+			sTopo.sockets[cpuInfo.SocketID].nodes[nodeIndex].l3Groups[l3Index].cores[coreIndex].cpuOneID = osId + (numCoresPerL3Group * numL3GroupsPerNode * numNodesPerSocket * topo.NumSockets)
+		}
+	}
+
+	//debug dump ServerTopology
+	/*
+		klog.InfoS("ServerTopology dump")
+		for s := 0; s < topo.NumSockets; s++ {
+			klog.InfoS("st ", "socket:", s)
+			for n := 0; n < numNodesPerSocket; n++ {
+				klog.InfoS("st   ", "node:", n)
+				for l := 0; l < numL3GroupsPerNode; l++ {
+					klog.InfoS("st   ", "l3:", l)
+					for c := 0; c < numCoresPerL3Group; c++ {
+						klog.InfoS("st    ", "core:", c, "cpu0ID", sTopo.sockets[s].nodes[n].l3Groups[l].cores[c].coreID)
+						if smtOn > 0 {
+							klog.InfoS("st    ", "core:", c, "cpu1ID", sTopo.sockets[s].nodes[n].l3Groups[l].cores[c].cpuOneID)
+						}
+					}
+				}
+			}
+		}
+		klog.InfoS("ServerTopology dump end")
+	*/
+	return &sTopo
+}
+
+func ServerTopologyNodes(topo *ServerTopology) int {
+	return len(topo.sockets) * len(topo.sockets[0].nodes)
+}
+func ServerTopologyL3GroupsPerNode(topo *ServerTopology) int {
+	return len(topo.sockets[0].nodes[0].l3Groups)
+}
+func ServerTopologyCPUsPerL3Group(topo *ServerTopology) int {
+	return topo.sockets[0].nodes[0].l3Groups[0].coresPerL3 * topo.smtOn
+}
+
+func ServerTopologySetAvailable(sTopo *ServerTopology, availableCPUs cpuset.CPUSet) {
+	if availableCPUs.IsEmpty() {
+		return
+	}
+	klog.InfoS("ServerTopologySetAvailable enter")
+	//first clear sTopo available counters
+	for socket := 0; socket < len(sTopo.sockets); socket++ {
+		sTopo.sockets[socket].available = 0
+		for node := 0; node < len(sTopo.sockets[socket].nodes); node++ {
+			sTopo.sockets[socket].nodes[node].available = 0
+			for l3 := 0; l3 < len(sTopo.sockets[socket].nodes[node].l3Groups); l3++ {
+				sTopo.sockets[socket].nodes[node].l3Groups[l3].available = 0
+				for core := 0; core < len(sTopo.sockets[socket].nodes[node].l3Groups[l3].cores); core++ {
+					sTopo.sockets[socket].nodes[node].l3Groups[l3].cores[core].available = 0
+				}
+			}
+		}
+	}
+
+	for socket := 0; socket < len(sTopo.sockets); socket++ {
+		for node := 0; node < len(sTopo.sockets[socket].nodes); node++ {
+			for l3 := 0; l3 < len(sTopo.sockets[socket].nodes[node].l3Groups); l3++ {
+				for core := 0; core < len(sTopo.sockets[socket].nodes[node].l3Groups[l3].cores); core++ {
+					if availableCPUs.Contains(sTopo.sockets[socket].nodes[node].l3Groups[l3].cores[core].coreID) {
+						sTopo.sockets[socket].nodes[node].l3Groups[l3].cores[core].available = 1
+						sTopo.sockets[socket].nodes[node].l3Groups[l3].available++
+						sTopo.sockets[socket].nodes[node].available++
+						sTopo.sockets[socket].available++
+						sTopo.available++
+					}
+				}
+			}
+		}
+	}
+	//dump results
+	/*
+		for socket := 0; socket < len(sTopo.sockets); socket++ {
+			klog.InfoS("ServerTopologySetAvailable", "socket", socket, "avaiable", sTopo.sockets[socket].available)
+			for node := 0; node < len(sTopo.sockets[socket].nodes); node++ {
+				klog.InfoS("ServerTopologySetAvailable", "  node", node, "avaiable", sTopo.sockets[socket].nodes[node].available)
+				for l3 := 0; l3 < len(sTopo.sockets[socket].nodes[node].l3Groups); l3++ {
+					klog.InfoS("ServerTopologySetAvailable", "    l3", l3, "avaiable", sTopo.sockets[socket].nodes[node].l3Groups[l3].available)
+					for core := 0; core < len(sTopo.sockets[socket].nodes[node].l3Groups[l3].cores); core++ {
+						klog.InfoS("ServerTopologySetAvailable", "      Core", core, "avaiable", sTopo.sockets[socket].nodes[node].l3Groups[l3].cores[core].available,
+							"cpuID", sTopo.sockets[socket].nodes[node].l3Groups[l3].cores[core].coreID)
+					}
+				}
+			}
+		}
+	*/
+	klog.InfoS("ServerTopologySetAvailable end", "vailable", sTopo.available)
+}
+
+func ServerTopologyQuery(sTopo *ServerTopology, cpus int, count int, sockSelect int, nodeSelect int) *matchSet {
+	//klog.InfoS("enter ServerTopologyQuery", "size cpus", cpus, "count", count, "nodeSelect", nodeSelect, "smtOn", sTopo.smtOn)
+	matchSet := matchSet{}
+	matchSet.cpusets = make(map[int]cpuset.CPUSet)
+
+	coreAsk := cpus
+	index := 0
+	var workset [32]int //TODO use append
+	if sTopo.smtOn > 1 {
+		coreAsk = coreAsk / 2 //TODO assume SMT == 2
+	}
+	coreAskCnt := 0
+	//klog.InfoS("ServerTopologyQuery 1", "CoreAsk", coreAsk, "avaiable", sTopo.available)
+	if sTopo.available < coreAsk {
+		//no point in continuing
+		return &matchSet
+	}
+
+	for socket := 0; socket < len(sTopo.sockets); socket++ {
+		if sockSelect >= 0 && sockSelect != socket {
+			//also handles out of range sockSelect
+			continue
+		}
+		if sockSelect >= 0 {
+			//assume == socket
+			//all sets must be found in this socket
+			if sTopo.sockets[socket].available < coreAsk {
+				continue
+			}
+		}
+		//	klog.InfoS("ServerTopologyQuery 2", "sock", socket, "available", sTopo.sockets[socket].available)
+		for node := 0; node < len(sTopo.sockets[socket].nodes); node++ {
+			if nodeSelect >= 0 && nodeSelect != node {
+				//also handles out of range nodeSelect
+				continue
+			}
+			if nodeSelect >= 0 {
+				//assume == node
+				//all sets must be found in this node
+				if sTopo.sockets[socket].nodes[node].available < coreAsk {
+					continue
+				}
+			}
+			//klog.InfoS("ServerTopologyQuery 3", "node", node, "available", sTopo.sockets[socket].nodes[node].available)
+			for l3 := 0; l3 < len(sTopo.sockets[socket].nodes[node].l3Groups); l3++ {
+				if sTopo.sockets[socket].nodes[node].l3Groups[l3].available == 0 {
+					continue
+				}
+				if sTopo.sockets[socket].nodes[node].l3Groups[l3].available < coreAsk {
+					continue
+				}
+				if coreAskCnt >= count {
+					break
+				}
+				//klog.InfoS("ServerTopologyQuery 4", "l3", l3, "available", sTopo.sockets[socket].nodes[node].l3Groups[l3].available)
+				index = 0
+				coreCnt := 0
+				for core := 0; core < len(sTopo.sockets[socket].nodes[node].l3Groups[l3].cores); core++ {
+					if sTopo.sockets[socket].nodes[node].l3Groups[l3].cores[core].available == 1 {
+						workset[index] = sTopo.sockets[socket].nodes[node].l3Groups[l3].cores[core].coreID //TODO use append
+						//klog.InfoS("ServerTopologyQuery -", "cpu", workset[index])
+						index++
+						coreCnt++
+						if sTopo.smtOn > 1 {
+							workset[index] = sTopo.sockets[socket].nodes[node].l3Groups[l3].cores[core].cpuOneID
+							//klog.InfoS("ServerTopologyQuery -", "cpu", workset[index])
+							index++
+						}
+					}
+					if coreAskCnt < count && coreCnt >= coreAsk {
+						cpuSet := cpuset.New()
+						for x := 0; x < index; x++ {
+							for y := 0; y < len(sTopo.sockets[socket].nodes[node].l3Groups[l3].cores); y++ {
+								if workset[x] == sTopo.sockets[socket].nodes[node].l3Groups[l3].cores[y].coreID {
+									sTopo.sockets[socket].nodes[node].l3Groups[l3].cores[y].available = 0
+									sTopo.sockets[socket].nodes[node].l3Groups[l3].available--
+									sTopo.sockets[socket].nodes[node].available--
+									sTopo.sockets[socket].available--
+									sTopo.available--
+								}
+							}
+							cpuSet = cpuSet.Union(cpuset.New(workset[x]))
+						}
+						//klog.InfoS("ServerTopologyQuery match", "cpuSet", cpuSet)
+						matchSet.cpusets[coreAskCnt] = cpuSet
+						coreAskCnt++
+						index = 0
+						coreCnt = 0
+					}
+					if coreAskCnt >= count {
+						break
+					}
+				}
+			}
+		}
+	}
+	/*	*/
+	for n, cset := range matchSet.cpusets {
+		klog.InfoS("ServerTopologyQuery 6 match", "n", n, "cpuset", cset)
+	}
+	klog.InfoS("ServerTopologyQuery end")
+	/* */
+	return &matchSet
+}
+
 func takeByTopologyNUMAPacked(topo *topology.CPUTopology, availableCPUs cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
+	klog.InfoS("enter cpu_assignment: takeByTopologyNUMAPacked v1.0", "availableCPUs", availableCPUs, "numCPUs", numCPUs)
+	var serverTopo *ServerTopology
+	serverTopo = ServerTopologyNew(topo)
+
+	ServerTopologySetAvailable(serverTopo, availableCPUs)
+	//klog.InfoS("cpu_assignment: takeByTopologyNUMAPacked", "total avaiable cores", serverTopo.available, "cpus", serverTopo.available*serverTopo.smtOn)
+	var matches0 *matchSet
+	var matches1 *matchSet
+	numL3Groups := ServerTopologyL3GroupsPerNode(serverTopo)
+	numCpusPerL3 := ServerTopologyCPUsPerL3Group(serverTopo)
+
 	acc := newCPUAccumulator(topo, availableCPUs, numCPUs)
+	if numCPUs == 0 {
+		return acc.result, nil
+	}
+
+	if numCPUs <= numCpusPerL3 {
+		//try to fit request on one L3Group, any node
+		matches0 = ServerTopologyQuery(serverTopo, numCPUs, 1, -1, -1)
+		klog.InfoS("cpu_assignment: takeByTopologyNUMAPacked 1", "matches", *matches0)
+		if len(matches0.cpusets) > 0 {
+			acc.result = matches0.cpusets[0]
+			return acc.result, nil
+		} else {
+			// this is NUMAPacked so all allocation must be from the numa node
+			for n := 0; n < ServerTopologyNodes(serverTopo); n++ {
+				ServerTopologySetAvailable(serverTopo, availableCPUs)
+				remainder := numCPUs
+				size1 := numCPUs - serverTopo.smtOn
+				for iter := 0; iter < 4 && remainder > 0; iter++ {
+					matches0 = ServerTopologyQuery(serverTopo, size1, 1, -1, n)
+					if len(matches0.cpusets) >= 1 {
+						acc.result = acc.result.Union(matches0.cpusets[0])
+						remainder -= size1
+						if size1 > remainder {
+							size1 = remainder
+						}
+						if remainder == 0 {
+							return acc.result, nil
+						}
+
+					} else {
+						size1 = size1 - serverTopo.smtOn
+					}
+					//try next node if there is one
+				}
+				//try a smaller first ask
+			}
+
+		}
+		//drop through to old code for now
+	} else {
+		// numCPUs > numCpusPerL3
+		if numL3Groups > 1 {
+			//only allow ask up to l3Group size*2 on multi l3Group servers for now
+			if numCPUs <= ServerTopologyCPUsPerL3Group(serverTopo)*2 {
+				//klog.InfoS("cpu_assignment: takeByTopologyNUMAPacked 2 numCPUs <= numCpusPerL3*2 ")
+				//handle two special cases
+				// numCPUs == 2 * l3group size
+				// single L3group + exact remainder fits in one other l3Group
+				for n := 0; n < ServerTopologyNodes(serverTopo); n++ {
+					ServerTopologySetAvailable(serverTopo, availableCPUs)
+					matches0 = ServerTopologyQuery(serverTopo, numCpusPerL3, 1, -1, n)
+					if len(matches0.cpusets) >= 1 {
+						//found one single l3group avaiable
+						matches1 = ServerTopologyQuery(serverTopo, numCPUs-numCpusPerL3, 1, -1, n)
+						if len(matches0.cpusets) >= 1 {
+							//found the remainder in a single l3group
+							acc.result = matches0.cpusets[0]
+							acc.result = acc.result.Union(matches1.cpusets[0])
+							return acc.result, nil
+						}
+					}
+					//try next node if there is one
+				}
+				//dropped through
+				for n := 0; n < ServerTopologyNodes(serverTopo); n++ {
+					ServerTopologySetAvailable(serverTopo, availableCPUs)
+					remainder := numCPUs
+					first := ServerTopologyCPUsPerL3Group(serverTopo)
+					attempts := 0
+					l3Groups := 0
+					for ; attempts < 10 && remainder > 0; attempts++ {
+						matches0 = ServerTopologyQuery(serverTopo, first, 1, -1, n)
+						if len(matches0.cpusets) >= 1 {
+							acc.result = acc.result.Union(matches0.cpusets[0])
+							remainder -= first
+							if first > remainder {
+								first = remainder
+							}
+							l3Groups++
+							klog.InfoS("cpu_assignment: dropthru", "remainder", remainder, "l3Groups", l3Groups)
+							if remainder == 0 {
+								return acc.result, nil
+							}
+						} else {
+							first = first - serverTopo.smtOn
+						}
+					}
+
+				}
+			}
+			// > numCpusPerL3*2
+			return acc.result, nil
+		} else {
+			//single l3 node
+			//not possible
+			return acc.result, nil
+		}
+	}
+
 	if acc.isSatisfied() {
 		return acc.result, nil
 	}

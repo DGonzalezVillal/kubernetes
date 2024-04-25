@@ -293,7 +293,7 @@ func (p *staticPolicy) Allocate(s state.State, pod *v1.Pod, container *v1.Contai
 		return nil
 	}
 
-	klog.InfoS("Static policy: Allocate", "pod", klog.KObj(pod), "containerName", container.Name)
+	klog.InfoS("Static policy: Allocate", "pod", klog.KObj(pod), "containerName", container.Name, "numCPUs", numCPUs)
 	// container belongs in an exclusively allocated pool
 	metrics.CPUManagerPinningRequestsTotal.Inc()
 	defer func() {
@@ -343,16 +343,57 @@ func (p *staticPolicy) Allocate(s state.State, pod *v1.Pod, container *v1.Contai
 	// Call Topology Manager to get the aligned socket affinity across all hint providers.
 	hint := p.affinity.GetAffinity(string(pod.UID), container.Name)
 	klog.InfoS("Topology Affinity", "pod", klog.KObj(pod), "containerName", container.Name, "affinity", hint)
+	//AMD add
+	//containers within PODs need to all be in
+	// 1 same numa node if single configure
+	// 2 same l3Group or minimum number of
+	//
+	//for pods with a single container existing code works
+	// search key Martin
+	podNumCPUs := p.podGuaranteedCPUs(pod)
+	if numCPUs != podNumCPUs {
+		cpuset, err := p.allocateCPUs(s, podNumCPUs, hint.NUMANodeAffinity, p.cpusToReuse[string(pod.UID)])
+		if err != nil {
+			klog.ErrorS(err, "Unable to allocate CPUs", "pod", klog.KObj(pod), "numCPUs", podNumCPUs)
+			return err
+		}
+		klog.InfoS("900 4 ", " podNumCPUs", podNumCPUs, "cpuset", cpuset)
+		//have cpu set
+		//TODO sort containers
+		for _, podContainer := range pod.Spec.Containers {
+			if _, ok := podContainer.Resources.Requests[v1.ResourceCPU]; !ok {
+				continue
+			}
+			requestedByAppContainer := p.guaranteedCPUs(pod, &podContainer)
+			remainingCPUs, err := p.takeByTopology(cpuset, requestedByAppContainer)
+			if err != nil {
+				return err
+			}
+			klog.InfoS("900 4 ", "container", podContainer.Name, "cpuSet", remainingCPUs)
+			klog.InfoS("900 5 -> state:SetCPUSet", "cpuset", remainingCPUs)
+			s.SetCPUSet(string(pod.UID), podContainer.Name, remainingCPUs)
+			klog.InfoS("s900 21-> policy:updateCPUsToReuse", "cpuset", remainingCPUs)
+			p.updateCPUsToReuse(pod, &podContainer, cpuset)
 
-	// Allocate CPUs according to the NUMA affinity contained in the hint.
-	cpuset, err := p.allocateCPUs(s, numCPUs, hint.NUMANodeAffinity, p.cpusToReuse[string(pod.UID)])
-	if err != nil {
-		klog.ErrorS(err, "Unable to allocate CPUs", "pod", klog.KObj(pod), "containerName", container.Name, "numCPUs", numCPUs)
-		return err
+			cpuset = cpuset.Difference(remainingCPUs)
+
+		}
+		klog.InfoS("900 25 end")
+
+	} else {
+
+		// Allocate CPUs according to the NUMA affinity contained in the hint.
+		cpuset, err := p.allocateCPUs(s, numCPUs, hint.NUMANodeAffinity, p.cpusToReuse[string(pod.UID)])
+		if err != nil {
+			klog.ErrorS(err, "Unable to allocate CPUs", "pod", klog.KObj(pod), "containerName", container.Name, "numCPUs", numCPUs)
+			return err
+		}
+		klog.InfoS("900 20 -> state:SetCPUSet", "cpuset", cpuset)
+		s.SetCPUSet(string(pod.UID), container.Name, cpuset)
+		klog.InfoS("s900 21-> policy:updateCPUsToReuse", "cpuset", cpuset)
+		p.updateCPUsToReuse(pod, container, cpuset)
+		klog.InfoS("900 23 end")
 	}
-	s.SetCPUSet(string(pod.UID), container.Name, cpuset)
-	p.updateCPUsToReuse(pod, container, cpuset)
-
 	return nil
 }
 
@@ -403,13 +444,15 @@ func (p *staticPolicy) allocateCPUs(s state.State, numCPUs int, numaAffinity bit
 
 		result = result.Union(alignedCPUs)
 	}
-
+	klog.InfoS("AllocateCPUs 1", "result", result, "remainder", numCPUs-result.Size())
 	// Get any remaining CPUs from what's leftover after attempting to grab aligned ones.
-	remainingCPUs, err := p.takeByTopology(allocatableCPUs.Difference(result), numCPUs-result.Size())
-	if err != nil {
-		return cpuset.New(), err
+	if numCPUs-result.Size() > 0 {
+		remainingCPUs, err := p.takeByTopology(allocatableCPUs.Difference(result), numCPUs-result.Size())
+		if err != nil {
+			return cpuset.New(), err
+		}
+		result = result.Union(remainingCPUs)
 	}
-	result = result.Union(remainingCPUs)
 
 	// Remove allocated CPUs from the shared CPUSet.
 	s.SetDefaultCPUSet(s.GetDefaultCPUSet().Difference(result))
@@ -584,7 +627,7 @@ func (p *staticPolicy) GetPodTopologyHints(s state.State, pod *v1.Pod) map[strin
 	}
 }
 
-// generateCPUtopologyHints generates a set of TopologyHints given the set of
+// generateCPUTopologyHints generates a set of TopologyHints given the set of
 // available CPUs and the number of CPUs being requested.
 //
 // It follows the convention of marking all hints that have the same number of

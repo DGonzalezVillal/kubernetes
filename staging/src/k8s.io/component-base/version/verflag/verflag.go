@@ -105,7 +105,7 @@ func PrintAndExitIfRequested() {
 		fmt.Printf("%#v\n", version.Get())
 		os.Exit(0)
 	} else if *versionFlag == VersionTrue {
-		fmt.Printf("%s %s\n", programName, version.Get())
+		fmt.Printf("%s %s AMD special 1.4\n\n", programName, version.Get())
 		os.Exit(0)
 	}
 }
